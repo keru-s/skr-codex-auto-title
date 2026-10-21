@@ -1,0 +1,4 @@
+interface:
+  display_name: "SKR Codex 会话自动命名"
+  short_description: "全局或按项目安装首次任务完成自动命名 hook，使用独立 Luna 判定与生成标题"
+  default_prompt: "使用 $skr-codex-auto-title 为当前项目安装并验证首次任务完成自动命名 hook。"

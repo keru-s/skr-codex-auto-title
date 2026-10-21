@@ -1,0 +1,9 @@
+[project]
+name = "skr-codex-auto-title"
+version = "1.0.0"
+description = "Name Codex conversations after the first completed task"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
