@@ -41,7 +41,7 @@ class LightweightTests(unittest.TestCase):
         self.assertTrue(self.state()['done'])
         self.assertEqual(calls, ['已交付解释', '最新结果已交付'])
         self.assertEqual(self.rpc.renames, 1)
-        self.sleep.assert_not_called()
+        self.assertEqual(self.sleep.call_args_list[0].args[0], 2)
 
     def test_large_first_request_no_longer_blocks_naming(self):
         rows = self.transcript.read_text().splitlines()
@@ -80,7 +80,7 @@ class LightweightTests(unittest.TestCase):
         self.assertTrue(self.state()['done'])
         self.assertEqual(self.rpc.assessments, 1)
 
-    def test_model_timeout_attempts_once_then_next_stop_recovers(self):
+    def test_model_timeout_exhausts_bounded_attempts_then_next_stop_recovers(self):
         original = self.rpc.assess
         attempts = []
         def timeout(packet, modules):
@@ -88,8 +88,8 @@ class LightweightTests(unittest.TestCase):
             raise TimeoutError('assessment timeout')
         self.rpc.assess = timeout
         self.naming.hook(self.event)
-        self.assertEqual(len(attempts), 1)
-        self.sleep.assert_not_called()
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2, 5])
         self.assertFalse(self.state().get('done', False))
         self.rpc.assess = original
         self.naming.hook(dict(self.event, turn_id='turn-2'))

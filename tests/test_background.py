@@ -122,7 +122,7 @@ class BackgroundTests(unittest.TestCase):
         self.rpc.mismatch = False
         self.naming.hook(self.event)
         self.assertTrue(self.state()['done'])
-        self.assertEqual(self.rpc.renames, 1)
+        self.assertEqual(self.rpc.renames, 3)
         self.assertEqual(self.rpc.assessments, 1)
 
     def test_should_serialize_duplicate_workers_and_rename_only_once(self):
@@ -170,7 +170,7 @@ class BackgroundTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, r'phase=assessment/turn-completed, elapsed_s=25'):
             rpc.receive(rpc.deadline)
 
-    def test_should_retry_timeouts_on_later_stops_then_complete(self):
+    def test_should_retry_timeouts_with_backoff_then_complete(self):
         original = self.rpc.assess
         calls = []
         def assess(packet, modules):
@@ -180,27 +180,20 @@ class BackgroundTests(unittest.TestCase):
             return original(packet, modules)
         self.rpc.assess = assess
         self.naming.hook(self.event)
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn('done', self.state())
-        self.naming.hook(dict(self.event, turn_id='turn-2'))
-        self.assertEqual(len(calls), 2)
-        self.naming.hook(dict(self.event, turn_id='turn-3'))
         self.assertTrue(self.state()['done'])
         self.assertEqual(len(calls), 3)
-        self.sleep.assert_not_called()
-        log = next((self.directory / 'logs').glob('*.jsonl'))
-        errors = [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)['status'] == 'error']
-        self.assertEqual([e['attempt'] for e in errors], [1, 1])
-        self.assertTrue(all(e['phase'] == 'assess' and e['next_trigger'] == 'next_stop' for e in errors))
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2, 5])
+        errors = [json.loads(line) for line in next((self.directory / 'logs').glob('*.jsonl')).read_text().splitlines() if json.loads(line)['status'] == 'error']
+        self.assertEqual([e['attempt'] for e in errors], [1, 2])
 
-    def test_should_stop_after_one_failure_keep_job_and_pending(self):
+    def test_should_stop_after_three_failures_keep_job_and_pending(self):
         self.rpc.fail_rename = True
         self.naming.hook(self.event)
-        self.assertEqual(self.rpc.renames, 1)
+        self.assertEqual(self.rpc.renames, 3)
         self.assertEqual(self.rpc.assessments, 1)
         self.assertNotIn('done', self.state())
         self.assertIn('pending', self.state())
-        self.assertEqual(len(list((self.directory / 'jobs/test-session').glob('*.json'))), 1)
+        self.assertEqual(len(list(self.naming.jobs('test-session').glob('*.json'))), 1)
         errors = [json.loads(line) for line in next((self.directory / 'logs').glob('*.jsonl')).read_text().splitlines()]
         self.assertEqual(errors[-1]['phase'], 'rename')
         self.assertIsNone(errors[-1]['retry_in_s'])
@@ -214,8 +207,6 @@ class BackgroundTests(unittest.TestCase):
             return result
         self.rpc.call = call
         self.naming.hook(self.event)
-        self.assertNotIn('done', self.state())
-        self.naming.hook(dict(self.event, turn_id='turn-2'))
         self.assertTrue(self.state()['done'])
         self.assertEqual(self.rpc.renames, 1)
         self.assertEqual(self.rpc.assessments, 1)
@@ -226,7 +217,7 @@ class BackgroundTests(unittest.TestCase):
         m.atomic_json(self.directory / 'settings.json', dict(self.settings, enabled=False))
         self.rpc.fail_rename = False
         m.Naming(self.root).hook(dict(self.event, turn_id='turn-2'))
-        self.assertEqual(self.rpc.renames, 1)
+        self.assertEqual(self.rpc.renames, 3)
         self.assertNotIn('done', self.state())
 
     def test_should_start_new_job_while_idle_worker_closes_connection(self):

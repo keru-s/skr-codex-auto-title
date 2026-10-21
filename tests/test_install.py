@@ -193,35 +193,18 @@ class InstallTests(unittest.TestCase):
             m.manage(self.root, 'uninstall', self.manifest())
         self.assertEqual((self.home / 'config.toml').read_bytes(), before)
 
-    def test_should_upgrade_legacy_sync_handlers_and_keep_every_existing_state_byte(self):
+    def test_should_reject_unknown_unpublished_layout_without_changes(self):
         self.install()
-        path = self.root / '.codex/hooks.json'
-        hooks = json.loads(path.read_text())
-        own = hooks['hooks']['Stop'][1]['hooks'][0]
-        own.pop('async')
-        own['timeout'] = 10
-        path.write_bytes(m.encoded(hooks))
         manifest = self.manifest()
         manifest.pop('backend_sha256')
-        manifest.pop('skill_version')
-        (self.root / m.ADMIN / 'backend.json').unlink()
-        (self.root / m.ADMIN / 'installation.json').write_bytes(m.encoded(manifest))
-        state = self.root / m.STATE / 'named-chat.json'
-        before = b'{"done":true,"title":"existing title"}'
-        state.write_bytes(before)
-        settings_before = (self.root / m.STATE / 'settings.json').read_bytes()
-        m.upgrade(self.root, 'unused', self.home, manifest)
-        after = json.loads(path.read_text())
-        self.assertEqual(after['hooks']['Stop'][0], self.hooks['hooks']['Stop'][0])
-        self.assertTrue(after['hooks']['Stop'][1]['hooks'][0]['async'])
-        self.assertEqual(state.read_bytes(), before)
-        self.assertEqual((self.root / m.STATE / 'settings.json').read_bytes(), settings_before)
-        self.assertEqual(self.manifest()['skill_version'], '1.0.0')
+        before = (self.home / 'config.toml').read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'layout'):
+            m.upgrade(self.root, 'unused', self.home, manifest)
+        self.assertEqual((self.home / 'config.toml').read_bytes(), before)
 
     def test_should_upgrade_without_duplicate_trust_or_lost_state(self):
         self.install()
         manifest = self.manifest()
-        manifest['skill_version'] = 'test-upgrade-base'
         (self.root / m.ADMIN / 'installation.json').write_bytes(m.encoded(manifest))
         state = self.root / m.STATE / 'already-named.json'
         state.write_bytes(b'{"done":true,"title":"existing title"}')

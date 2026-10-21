@@ -34,3 +34,5 @@ uv run --no-project --python '>=3.11' python <installer> verify --scope global -
 全局命名使用通用模块，不把安装所在项目的术语用于所有项目。脚本及私有状态位于所选 CODEX_HOME/skr-codex-auto-title/，注册写入 CODEX_HOME/hooks.json。全局安装不替用户信任整个业务项目。两种范围并存时项目安装优先；项目安装停用后全局也不接管。
 
 全局 project-disable/project-enable 规则保存在个人目录，对两种范围都生效，按最长匹配路径选择。安装过全局 Hook 后即可管理这些规则，卸载后仍可重新开启项目。项目级 disable 只影响该项目安装；全局 disable 只影响全局安装。
+
+全局安装的项目术语单独管理：读取目标项目说明后，使用 project-modules --scope global --root <project> --modules-file <file>，再用 project-status 确认 module_source。清除使用 project-modules-clear。仅该项目及其子目录继承，不影响其他项目；没有配置时按交付内容概括模块，明确这是未读取项目说明的通用回退。

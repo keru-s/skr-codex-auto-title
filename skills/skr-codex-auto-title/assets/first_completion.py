@@ -9,6 +9,7 @@ try:
 except ImportError:
     raise SystemExit('This hook requires macOS or Linux (POSIX file locks).')
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,75 @@ def atomic_json(path, value):
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+REQUEST_TIMEOUT = 15
+MODEL_TIMEOUT = 60
+RPC_TIMEOUT = 120
+WORKER_TIMEOUT = 400
+HOOK_TIMEOUT = 420
+RETRY_DELAYS = (2, 5)
+
+
+def project_terms(home, project, default):
+    path = Path(home) / 'skr-codex-auto-title/coordination/modules.json'
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict) or any(not isinstance(k, str) or not Path(k).is_absolute()
+                                        or not isinstance(v, str) or not v.strip() for k, v in data.items()):
+        raise ValueError('unknown project module configuration layout')
+    project = Path(project).resolve()
+    matches = [(Path(key).resolve(), text) for key, text in data.items() if project.is_relative_to(Path(key).resolve())]
+    if matches:
+        owner, text = max(matches, key=lambda pair: len(pair[0].parts))
+        return text, {'kind': 'project_modules', 'project': str(owner)}
+    return default, {'kind': 'global_default', 'project': None}
+
+
+def migrate_jobs(root, shared, changes, manifest):
+    """Move the explicitly supported published 1.0.0 local queue transactionally."""
+    source = root / 'runtime/skr-codex-auto-title/jobs'
+    files = sorted(source.glob('*/*.json')) if source.exists() else []
+    if not files:
+        return 0
+    if manifest.get('queue_storage') is not None:
+        raise RuntimeError('unexpected local queue in shared layout; inspect without conversion')
+    jobs = []
+    required = {'session_id', 'turn_id', 'queued_at', 'project', 'transcript_path', 'packet'}
+    for path in files:
+        job = json.loads(path.read_text())
+        if (not isinstance(job, dict) or set(job) != required
+                or not isinstance(job['session_id'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', job['session_id'])
+                or job['session_id'] == 'settings' or path.parent.name != job['session_id']
+                or not isinstance(job['turn_id'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', job['turn_id'])
+                or path.name != hashlib.sha256(job['turn_id'].encode()).hexdigest() + '.json'
+                or type(job['queued_at']) not in (int, float) or not math.isfinite(job['queued_at']) or job['queued_at'] < 0
+                or not isinstance(job['project'], str) or not Path(job['project']).is_absolute()
+                or not isinstance(job['transcript_path'], str) or not Path(job['transcript_path']).is_absolute()):
+            raise RuntimeError('unknown local queue layout: ' + str(path))
+        if root != Path(manifest['user_config']).parent / 'skr-codex-auto-title' and not Path(job['project']).resolve().is_relative_to(root.resolve()):
+            raise RuntimeError('local queue project ownership mismatch')
+        if job['packet'] is not None:
+            compact_packet(job['packet'])
+        target = shared / 'jobs' / job['session_id'] / ('legacy-' + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16] + '-' + path.name)
+        if target.exists() and json.loads(target.read_text()) != job:
+            raise RuntimeError('conflicting shared queue; preserve both files and inspect')
+        jobs.append((path, target, job))
+    # Do not wait on a worker while the caller holds the installation state lock.
+    with contextlib.ExitStack() as stack:
+        for session in sorted({job['session_id'] for _, _, job in jobs}):
+            directory = shared / 'workers'
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            stream = stack.enter_context((directory / (session + '.lock')).open('a'))
+            os.chmod(stream.fileno(), 0o600)
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('active naming worker; retry migration after it finishes')
+        for old, target, job in jobs:
+            if not target.exists():
+                changes.set(target, (json.dumps(job, ensure_ascii=False, indent=2) + '\n').encode(), 0o600)
+            changes.set(old, None)
+    return len(jobs)
 
 
 REQUEST_LIMIT = 800
@@ -105,7 +175,7 @@ class Rpc:
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.p.stdout, selectors.EVENT_READ)
         self.buffer, self.events, self.sequence = b'', [], 0
-        self.deadline = min(time.monotonic() + 60, deadline if deadline is not None else float('inf'))
+        self.deadline = min(time.monotonic() + RPC_TIMEOUT, deadline if deadline is not None else float('inf'))
         self.phase = 'initialize'
         self.phase_started = time.monotonic()
         try:
@@ -140,12 +210,17 @@ class Rpc:
         self.sequence += 1
         identifier = self.sequence
         self.send({'id': identifier, 'method': method, 'params': params})
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + REQUEST_TIMEOUT
         while True:
             packet = self.receive(deadline)
             if packet.get('id') == identifier and 'method' not in packet:
                 if 'error' in packet:
-                    raise RuntimeError(method + ': ' + json.dumps(packet['error'], ensure_ascii=False))
+                    error = packet['error']
+                    message = method + ': ' + json.dumps(error, ensure_ascii=False)
+                    transient = re.search(r'timeout|temporar|unavailable|overload|rate.limit|try again|active writer', message, re.I)
+                    if error.get('code') in (-32600, -32601, -32602, 401, 403) and not transient:
+                        raise ValueError(message)
+                    raise RuntimeError(message)
                 return packet['result']
             self.events.append(packet)
 
@@ -160,7 +235,7 @@ class Rpc:
                             'config': {'features.hooks': False, 'web_search': 'disabled'}})
         thread = started['thread']
         if started.get('model') != self.model or thread.get('ephemeral') is not True:
-            raise RuntimeError('Requested model and ephemeral runtime not confirmed')
+            raise ValueError('Requested model and ephemeral runtime not confirmed')
         schema = {'type': 'object', 'properties': {'completed': {'type': 'boolean'}, 'title': {'type': 'string'},
                   'evidence': {'type': 'string'}}, 'required': ['completed', 'title', 'evidence'], 'additionalProperties': False}
         result = self.call('turn/start', {'threadId': thread['id'], 'model': self.model, 'effort': self.effort,
@@ -168,13 +243,13 @@ class Rpc:
                                       'untrusted_conversation': packet}, ensure_ascii=False)}], 'outputSchema': schema})
         turn_id = result['turn']['id']
         self.phase, self.phase_started = 'assessment/turn-completed', time.monotonic()
-        deadline = time.monotonic() + 25
+        deadline = time.monotonic() + MODEL_TIMEOUT
         output = None
         while True:
             notification = self.events.pop(0) if self.events else self.receive(deadline)
             if 'id' in notification and 'method' in notification:
                 self.send({'id': notification['id'], 'error': {'code': -32601, 'message': 'naming worker cannot approve tools'}})
-                raise RuntimeError('Luna requested a tool or approval')
+                raise ValueError('Luna requested a tool or approval')
             params = notification.get('params', {})
             if params.get('threadId') != thread['id'] or params.get('turnId', turn_id) != turn_id:
                 continue
@@ -182,12 +257,14 @@ class Rpc:
             if method in ('item/started', 'item/completed'):
                 item = params.get('item', {})
                 if item.get('type') not in ('userMessage', 'agentMessage', 'reasoning'):
-                    raise RuntimeError('Luna used an unexpected tool: ' + str(item.get('type')))
+                    raise ValueError('Luna used an unexpected tool: ' + str(item.get('type')))
                 if method == 'item/completed' and item.get('type') == 'agentMessage' and item.get('phase') == 'final_answer':
                     output = item['text']
             if method == 'turn/completed' and params.get('turn', {}).get('id') == turn_id:
-                if params['turn'].get('status') != 'completed' or output is None:
+                if params['turn'].get('status') != 'completed':
                     raise RuntimeError('Luna did not successfully deliver JSON')
+                if output is None:
+                    raise ValueError('Luna completed without a JSON result')
                 answer = json.loads(output)
                 validate_assessment(answer)
                 return answer, {'thread_id': thread['id'], 'turn_id': turn_id, 'model': started['model'],
@@ -254,6 +331,15 @@ class Naming:
         self.model = self.settings.get('naming_model', 'gpt-6-luna')
         self.effort = self.settings.get('naming_reasoning_effort', 'low')
 
+    def jobs(self, session):
+        return self.shared / 'jobs' / session
+
+    def guidance_for(self, project):
+        default = self.settings['module_guidance']
+        if self.settings.get('scope', 'project') == 'global':
+            return project_terms(self.home, project, default)
+        return default, {'kind': 'project_installation', 'project': str(self.root)}
+
     @contextlib.contextmanager
     def transaction(self, session):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', session) or session == 'settings':
@@ -304,7 +390,10 @@ class Naming:
         current = json.loads((self.directory / 'settings.json').read_text())
         if not current['enabled'] or job['session_id'] in current['excluded_session_ids']:
             return False
-        return self.project_allowed(Path(job['project']).resolve())
+        project = Path(job['project']).resolve()
+        if self.settings.get('scope', 'project') != 'global' and not project.is_relative_to(self.root):
+            return False
+        return self.project_allowed(project)
 
     def eligible(self, event):
         session = event.get('session_id', '')
@@ -366,7 +455,7 @@ class Naming:
                 job = {'session_id': session, 'turn_id': turn, 'queued_at': time.time(),
                        'transcript_path': event['transcript_path'], 'project': self.transcript_project(event),
                        'packet': None if state.get('pending') or (self.shared / 'pending' / (session + '.json')).exists() else self.packet(event)}
-                jobs = self.directory / 'jobs' / session
+                jobs = self.jobs(session)
                 jobs.mkdir(parents=True, exist_ok=True, mode=0o700)
                 path = jobs / (hashlib.sha256(turn.encode()).hexdigest() + '.json')
                 if not path.exists():
@@ -389,11 +478,11 @@ class Naming:
                 fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + WORKER_TIMEOUT
             while True:
                 continuation = self._run_jobs(session, deadline, lease)
                 with self.transaction(session) as state:
-                    queued = list((self.directory / 'jobs' / session).glob('*.json'))
+                    queued = list(self.jobs(session).glob('*.json'))
                     if (not state.get('done') and continuation is not None
                             and time.monotonic() < deadline
                             and any(path != continuation['retry_after'] for path in queued)):
@@ -404,123 +493,137 @@ class Naming:
                     return
 
     def _run_jobs(self, session, deadline, lease):
-        attempt = 1
-        rpc = None
-        path = None
-        phase, turn_id = 'load_job', None
-        started = time.monotonic()
-        try:
-            while True:
-                settings = json.loads((self.directory / 'settings.json').read_text())
-                if not settings['enabled'] or session in settings['excluded_session_ids']:
-                    return
-                with self.transaction(session) as state:
-                    if state.get('done'):
+        for attempt in range(1, 4):
+            rpc = None
+            path = None
+            phase, turn_id = 'load_job', None
+            started = time.monotonic()
+            try:
+                while True:
+                    settings = json.loads((self.directory / 'settings.json').read_text())
+                    if not settings['enabled'] or session in settings['excluded_session_ids']:
                         return
-                    paths = list((self.directory / 'jobs' / session).glob('*.json'))
-                    if not paths:
-                        fcntl.flock(lease, fcntl.LOCK_UN)
-                        return None
-                jobs = sorted(((json.loads(p.read_text()), p) for p in paths), key=lambda pair: pair[0]['queued_at'], reverse=True)
-                job, path = jobs[0]
-                # A later Stop replaces unsuccessful evaluations of older replies.
-                for _, obsolete in jobs[1:]:
-                    obsolete.unlink(missing_ok=True)
-                if job['session_id'] != session:
-                    raise ValueError('job session mismatch')
-                if not self.job_allowed(job):
-                    return
-                receipt = self.shared / 'completed' / (session + '.json')
-                if receipt.exists():
-                    with self.transaction(session) as state:
-                        state.update(done=True, **json.loads(receipt.read_text()))
-                    path.unlink()
-                    return
-                with self.transaction(session) as state:
-                    if job['turn_id'] in state.get('closed_turns', []):
-                        path.unlink()
-                        continue
-                    pending_path = self.shared / 'pending' / (session + '.json')
-                    pending = state.get('pending')
-                    if not pending and pending_path.exists():
-                        pending = json.loads(pending_path.read_text())
-                        state['pending'] = pending
-                    # A still-running 1.x owner must finish or expire before migration recovers it.
-                    if pending and pending.get('owner') != 'background-v2' and pending['lease_until'] > time.time():
-                        return
-                turn_id = job['turn_id']
-                if rpc is None:
-                    phase = 'initialize'
-                    backend = json.loads((self.root / 'runtime/skr-codex-auto-title-install/backend.json').read_text())
-                    rpc = Rpc(backend['codex'], backend['codex_home'], self.model, self.effort, deadline=deadline)
-                if not pending:
-                    phase = 'assess'
-                    job['packet'] = compact_packet(job['packet'])
-                    result, proof = rpc.assess(job['packet'], excerpt(self.settings['module_guidance'], MODULE_LIMIT))
-                    validate_assessment(result)
-                    atomic_json(self.directory / 'evidence' / session / (path.stem + '.json'),
-                                dict(job=job, result=result, inference=proof))
                     with self.transaction(session) as state:
                         if state.get('done'):
                             return
-                        if not json.loads((self.directory / 'settings.json').read_text())['enabled']:
-                            return
-                        state['assessment'] = dict(result, turn_id=job['turn_id'], model=self.model,
-                                                   agent_id=proof['thread_id'], transport='official-app-server-ephemeral')
-                        if not result['completed']:
-                            state.setdefault('closed_turns', []).append(job['turn_id'])
-                        else:
-                            state['pending'] = dict(title=result['title'], evidence=result['evidence'], model=self.model,
-                                                    first_completed_turn=job['turn_id'], token=uuid.uuid4().hex,
-                                                    lease_until=time.time() + 600, owner='background-v2')
-                            atomic_json(pending_path, state['pending'])
-                    if not result['completed']:
-                        path.unlink()
-                        continue
-                with self.transaction(session) as state:
-                    pending = dict(state['pending'])
-                with self.policy_gate(), self.transaction(session) as state:
+                        paths = list(self.jobs(session).glob('*.json'))
+                        if not paths:
+                            fcntl.flock(lease, fcntl.LOCK_UN)
+                            return None
+                    jobs = sorted(((json.loads(p.read_text()), p) for p in paths), key=lambda pair: pair[0]['queued_at'], reverse=True)
+                    job, path = jobs[0]
+                    # A later Stop replaces unsuccessful evaluations of older replies.
+                    for _, obsolete in jobs[1:]:
+                        obsolete.unlink(missing_ok=True)
+                    if job['session_id'] != session:
+                        raise ValueError('job session mismatch')
                     if not self.job_allowed(job):
                         return
-                    current = json.loads((self.directory / 'settings.json').read_text())
-                    if not current['enabled'] or session in current['excluded_session_ids']:
+                    receipt = self.shared / 'completed' / (session + '.json')
+                    if receipt.exists():
+                        with self.transaction(session) as state:
+                            state.update(done=True, **json.loads(receipt.read_text()))
+                        path.unlink()
                         return
-                    if state.get('pending', {}).get('token') != pending['token']:
-                        raise RuntimeError('pending owner changed')
-                    # Serialize disable with the short API mutation/readback phase.
-                    phase = 'read_title'
-                    observed = rpc.call('thread/read', {'threadId': session, 'includeTurns': False})['thread'].get('name')
-                    renamed = False
-                    if observed != pending['title']:
-                        phase = 'rename'
-                        rpc.call('thread/name/set', {'threadId': session, 'name': pending['title']})
-                        renamed = True
-                    phase = 'verify_title'
-                    observed = rpc.call('thread/read', {'threadId': session, 'includeTurns': False})['thread'].get('name')
-                    if observed != pending['title']:
-                        raise RuntimeError('official title readback mismatch')
-                    phase = 'persist_receipt'
-                    atomic_json(self.directory / 'evidence' / session / 'rename-receipt.json',
-                                dict(thread_id=session, title=observed, token=pending['token'],
-                                     rename_requested=renamed, api='thread/name/set', readback_api='thread/read'))
-                    state.update(done=True, title=observed, confirmed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                                 first_completed_turn=pending['first_completed_turn'])
-                    atomic_json(receipt, {key: state[key] for key in ('title', 'confirmed_at', 'first_completed_turn')})
-                    pending_path.unlink(missing_ok=True)
-                    del state['pending']
-                path.unlink()
-                self.log(session, 'done', job['turn_id'], attempt=attempt, model=self.model)
-                return
-        except Exception as error:
-            self.log(session, 'error', str(error)[:1500], turn_id=turn_id,
-                     phase=phase, rpc_phase=getattr(rpc, 'phase', None),
-                     attempt=attempt, max_attempts=1, model=self.model,
-                     error_type=type(error).__name__, elapsed_s=round(time.monotonic() - started, 3),
-                     retry_in_s=None, next_trigger='next_stop')
-            return {'retry_after': path} if path is not None else None
-        finally:
-            if rpc is not None:
-                rpc.close()
+                    with self.transaction(session) as state:
+                        if job['turn_id'] in state.get('closed_turns', []):
+                            path.unlink()
+                            continue
+                        pending_path = self.shared / 'pending' / (session + '.json')
+                        pending = state.get('pending')
+                        if not pending and pending_path.exists():
+                            pending = json.loads(pending_path.read_text())
+                            state['pending'] = pending
+                        # A still-running 1.x owner must finish or expire before migration recovers it.
+                        if pending and pending.get('owner') != 'background-v2' and pending['lease_until'] > time.time():
+                            return
+                    turn_id = job['turn_id']
+                    if rpc is None:
+                        phase = 'initialize'
+                        backend = json.loads((self.root / 'runtime/skr-codex-auto-title-install/backend.json').read_text())
+                        rpc = Rpc(backend['codex'], backend['codex_home'], self.model, self.effort, deadline=deadline)
+                    if not pending:
+                        phase = 'assess'
+                        job['packet'] = compact_packet(job['packet'])
+                        guidance, guidance_source = self.guidance_for(Path(job['project']))
+                        result, proof = rpc.assess(job['packet'], excerpt(guidance, MODULE_LIMIT))
+                        proof = dict(proof, module_source=guidance_source)
+                        validate_assessment(result)
+                        atomic_json(self.directory / 'evidence' / session / (path.stem + '.json'),
+                                    dict(job=job, result=result, inference=proof))
+                        with self.transaction(session) as state:
+                            if state.get('done'):
+                                return
+                            if not json.loads((self.directory / 'settings.json').read_text())['enabled']:
+                                return
+                            state['assessment'] = dict(result, turn_id=job['turn_id'], model=self.model,
+                                                       agent_id=proof['thread_id'], transport='official-app-server-ephemeral')
+                            if not result['completed']:
+                                state.setdefault('closed_turns', []).append(job['turn_id'])
+                            else:
+                                state['pending'] = dict(title=result['title'], evidence=result['evidence'], model=self.model,
+                                                        first_completed_turn=job['turn_id'], token=uuid.uuid4().hex,
+                                                        lease_until=time.time() + 600, owner='background-v2')
+                                atomic_json(pending_path, state['pending'])
+                        if not result['completed']:
+                            path.unlink()
+                            continue
+                    with self.transaction(session) as state:
+                        pending = dict(state['pending'])
+                    with self.policy_gate(), self.transaction(session) as state:
+                        if not self.job_allowed(job):
+                            return
+                        current = json.loads((self.directory / 'settings.json').read_text())
+                        if not current['enabled'] or session in current['excluded_session_ids']:
+                            return
+                        if state.get('pending', {}).get('token') != pending['token']:
+                            raise RuntimeError('pending owner changed')
+                        # Serialize disable with the short API mutation/readback phase.
+                        phase = 'read_title'
+                        observed = rpc.call('thread/read', {'threadId': session, 'includeTurns': False})['thread'].get('name')
+                        renamed = False
+                        if observed != pending['title']:
+                            phase = 'rename'
+                            rpc.call('thread/name/set', {'threadId': session, 'name': pending['title']})
+                            renamed = True
+                        phase = 'verify_title'
+                        observed = rpc.call('thread/read', {'threadId': session, 'includeTurns': False})['thread'].get('name')
+                        if observed != pending['title']:
+                            raise RuntimeError('official title readback mismatch')
+                        phase = 'persist_receipt'
+                        atomic_json(self.directory / 'evidence' / session / 'rename-receipt.json',
+                                    dict(thread_id=session, title=observed, token=pending['token'],
+                                         rename_requested=renamed, api='thread/name/set', readback_api='thread/read'))
+                        state.update(done=True, title=observed, confirmed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                                     first_completed_turn=pending['first_completed_turn'])
+                        atomic_json(receipt, {key: state[key] for key in ('title', 'confirmed_at', 'first_completed_turn')})
+                        pending_path.unlink(missing_ok=True)
+                        del state['pending']
+                    path.unlink()
+                    self.log(session, 'done', job['turn_id'], attempt=attempt, model=self.model)
+                    return
+            except Exception as error:
+                permanent = isinstance(error, (ValueError, KeyError, TypeError))
+                delay = RETRY_DELAYS[attempt - 1] if attempt < 3 and not permanent else None
+                if delay is not None and time.monotonic() + delay >= deadline:
+                    delay = None
+                self.log(session, 'error', str(error)[:1500], turn_id=turn_id,
+                         phase=phase, rpc_phase=getattr(rpc, 'phase', None),
+                         attempt=attempt, max_attempts=3, model=self.model,
+                         error_type=type(error).__name__, elapsed_s=round(time.monotonic() - started, 3),
+                         retry_in_s=delay,
+                         next_trigger='backoff' if delay is not None else ('invalid_input' if permanent else 'next_stop'))
+                if delay is None:
+                    return {'retry_after': path} if path is not None else None
+            finally:
+                if rpc is not None:
+                    rpc.close()
+
+            if attempt < 3:
+                delay = RETRY_DELAYS[attempt - 1]
+                if time.monotonic() + delay >= deadline:
+                    return {'retry_after': path} if path is not None else None
+                time.sleep(delay)
 
 
     def log(self, session, status, detail, **context):
@@ -538,6 +641,8 @@ def main():
     parser.add_argument('mode', choices=('hook',))
     parser.add_argument('--root', default=str(Path(__file__).resolve().parents[2]))
     args = parser.parse_args()
+    naming, payload = None, {}
+    started = time.monotonic()
     try:
         naming = Naming(args.root)
         payload = json.load(sys.stdin)
@@ -545,7 +650,11 @@ def main():
         print(json.dumps(response, ensure_ascii=False))
     except Exception as error:
         try:
-            naming.log(payload.get('session_id', 'unknown'), 'error', str(error)[:1500])
+            naming.log(payload.get('session_id', 'unknown') if isinstance(payload, dict) else 'unknown',
+                       'error', str(error)[:1500], phase='prepare_hook', attempt=0,
+                       max_attempts=3, error_type=type(error).__name__,
+                       elapsed_s=round(time.monotonic() - started, 3), retry_in_s=None,
+                       next_trigger='invalid_input')
         except Exception:
             pass
         print('{}')

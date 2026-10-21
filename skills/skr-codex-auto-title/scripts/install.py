@@ -2,6 +2,7 @@
 """Install/manage global or project background naming hooks, preserving state."""
 import argparse
 import contextlib
+import copy
 import datetime as dt
 try:
     import fcntl
@@ -29,6 +30,81 @@ ADMIN = 'runtime/skr-codex-auto-title-install'
 IGNORE = '\n# Codex first-completion naming state and private backups\n/' + STATE + '/\n/' + ADMIN + '/\n'
 
 
+def runtime_module():
+    spec = importlib.util.spec_from_file_location('title_runtime', ASSET)
+    runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runtime)
+    return runtime
+
+
+def validate_layout(manifest):
+    required = {'version', 'skill_version', 'backend_sha256', 'root', 'user_config', 'command',
+                'script_sha256', 'trust_start', 'trust_end', 'trust_block', 'trust_keys',
+                'original_hooks', 'original_hooks_text', 'backup'}
+    if (not isinstance(manifest, dict) or not required.issubset(manifest)
+            or manifest['version'] != 1 or manifest['skill_version'] != '1.0.0'
+            or manifest.get('queue_storage') not in (None, 'shared-v1')
+            or not isinstance(manifest['trust_keys'], list) or len(manifest['trust_keys']) != 2
+            or any(not isinstance(key, str) or not key for key in manifest['trust_keys'])
+            or len(set(manifest['trust_keys'])) != 2
+            or manifest['original_hooks'] is not None and not isinstance(manifest['original_hooks'], dict)
+            or manifest['original_hooks_text'] is not None and not isinstance(manifest['original_hooks_text'], str)
+            or any(not isinstance(manifest[key], str) for key in required - {'version', 'original_hooks', 'original_hooks_text', 'trust_keys'})):
+        raise RuntimeError('unsupported installation layout; only published 1.0.0 layout 1 is supported')
+    for key in ('backend_sha256', 'script_sha256'):
+        if not re.fullmatch(r'[a-f0-9]{64}', manifest[key]):
+            raise RuntimeError('invalid installation layout digest')
+
+
+def without_owned_trust(text, manifest):
+    """Recover missing comments only when the exact owned tables can be proved."""
+    start, end = manifest['trust_start'], manifest['trust_end']
+    if text.count(start) > 1 or text.count(end) > 1:
+        raise RuntimeError('duplicate trust markers; inspect before changing config')
+    if text.count(start) == text.count(end) == 1:
+        begin, finish = text.index(start), text.index(end) + len(end) + 1
+        if text[begin:finish] != manifest['trust_block']:
+            raise RuntimeError('owned trust block changed; inspect before changing config')
+        return text[:begin] + text[finish:], False
+    actual = tomllib.loads(text)
+    expected = tomllib.loads(manifest['trust_block']).get('hooks', {}).get('state', {})
+    if set(expected) != set(manifest['trust_keys']) or len(expected) != 2:
+        raise RuntimeError('cannot establish trust table ownership')
+    state = actual.get('hooks', {}).get('state', {})
+    if any(state.get(key) != value or set(value) != {'enabled', 'trusted_hash'} for key, value in expected.items()):
+        raise RuntimeError('owned trust table content differs; no recovery performed')
+    lines = text.splitlines(keepends=True)
+    remove = set()
+    for key in expected:
+        header = '[hooks.state.' + json.dumps(key) + ']'
+        matches = [i for i, line in enumerate(lines) if re.fullmatch(r'\s*' + re.escape(header) + r'\s*(?:#.*)?', line.rstrip('\r\n'))]
+        if len(matches) != 1:
+            raise RuntimeError('unknown owned trust table text layout; no recovery performed')
+        index = matches[0]
+        remove.add(index)
+        for i in range(index + 1, len(lines)):
+            stripped = lines[i].strip()
+            if stripped.startswith('['):
+                break
+            if not stripped or stripped.startswith('#'):
+                continue
+            if not re.match(r'^(?:trusted_hash|enabled)\s*=', stripped):
+                raise RuntimeError('unknown owned trust table field layout')
+            remove.add(i)
+    remove.update(i for i, line in enumerate(lines) if line.strip() in (start, end))
+    remaining = ''.join(line for i, line in enumerate(lines) if i not in remove)
+    expected_remaining = copy.deepcopy(actual)
+    for key in expected:
+        del expected_remaining['hooks']['state'][key]
+    def nonempty(value):
+        if not isinstance(value, dict):
+            return value
+        return {key: cleaned for key, item in value.items() if (cleaned := nonempty(item)) != {}}
+    if nonempty(tomllib.loads(remaining)) != nonempty(expected_remaining):
+        raise RuntimeError('recovery would affect unrelated configuration')
+    return remaining, True
+
+
 def global_root(home):
     return home / 'skr-codex-auto-title'
 
@@ -54,6 +130,31 @@ def project_policy(home, project, action):
         selected = max(matches, key=lambda item: len(item[0].parts)) if matches else None
         return {'project': str(project), 'enabled': selected[1] if selected else True,
                 'rule': str(selected[0]) if selected else None, 'action': action}
+
+
+def project_modules(home, project, action, text=None):
+    project = project.resolve()
+    directory = global_root(home) / 'coordination'
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (directory / '.lock').open('a') as stream:
+        os.chmod(stream.fileno(), 0o600)
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        path = directory / 'modules.json'
+        runtime = runtime_module()
+        runtime.project_terms(home, project, '')  # Validate existing data before changing it.
+        data = json.loads(path.read_text()) if path.exists() else {}
+        if action == 'project-modules':
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError('a non-empty UTF-8 modules file is required')
+            data[str(project)] = text.strip()
+        elif action == 'project-modules-clear':
+            data.pop(str(project), None)
+        else:
+            raise ValueError('unsupported project modules action')
+        write(path, encoded(data), 0o600)
+        effective, source = runtime.project_terms(home, project, '')
+        return {'action': action, 'project': str(project), 'module_source': source,
+                'characters': len(effective), 'maximum_sent': runtime.MODULE_LIMIT}
 
 
 def runtime_command(script):
@@ -231,6 +332,7 @@ def backend_data(binary, home):
 
 
 def verify(root, binary, home, manifest):
+    validate_layout(manifest)
     if manifest.get('root') != str(root) or manifest.get('user_config') != str(home / 'config.toml'):
         raise RuntimeError('installation root or CODEX_HOME changed; inspect manifest')
     if digest((root / '.codex/hooks/first_completion.py').read_bytes()) != manifest['script_sha256']:
@@ -273,7 +375,7 @@ def install(root, binary, home, modules, session=None, model='gpt-6-luna', effor
         handler = {'type': 'command', 'command': command, 'timeout': 10,
                    'statusMessage': '后台检查首次完成命名'}
         if event == 'Stop':
-            handler.update({'async': True, 'timeout': 75})
+            handler.update({'async': True, 'timeout': runtime_module().HOOK_TIMEOUT})
         hooks['hooks'].setdefault(event, []).append({'hooks': [handler]})
     changes = Changes(root)
     try:
@@ -303,7 +405,7 @@ def install(root, binary, home, modules, session=None, model='gpt-6-luna', effor
         user_new = user_before.decode() + '\n' + block
         tomllib.loads(user_new)
         changes.set(user_path, user_new.encode(), 0o600)
-        manifest = {'version': 1, 'skill_version': '1.0.0', 'backend_sha256': digest(backend),
+        manifest = {'version': 1, 'queue_storage': 'shared-v1', 'skill_version': '1.0.0', 'backend_sha256': digest(backend),
                     'root': str(root), 'user_config': str(user_path), 'command': command,
                     'script_sha256': digest(ASSET.read_bytes()), 'trust_start': start, 'trust_end': end,
                     'trust_block': block, 'trust_keys': [h['key'] for h in found],
@@ -324,12 +426,7 @@ def upgrade(root, binary, home, manifest):
     verify(root, binary, home, manifest)
     user_path = home / 'config.toml'
     user_before = user_path.read_text()
-    start, end = manifest['trust_start'], manifest['trust_end']
-    if user_before.count(start) != 1 or user_before.count(end) != 1:
-        raise RuntimeError('trust markers changed; inspect before upgrade')
-    begin, finish = user_before.index(start), user_before.index(end) + len(end) + 1
-    if user_before[begin:finish] != manifest['trust_block']:
-        raise RuntimeError('owned trust block changed; inspect before upgrade')
+    without_trust, recovered_trust = without_owned_trust(user_before, manifest)
     changes = Changes(root)
     try:
         changes.set(root / '.codex/hooks/first_completion.py', ASSET.read_bytes(), 0o644)
@@ -349,7 +446,7 @@ def upgrade(root, binary, home, manifest):
                         handler['command'] = command
                         handler['statusMessage'] = '后台检查首次完成命名'
                         if event == 'Stop':
-                            handler.update({'async': True, 'timeout': 75})
+                            handler.update({'async': True, 'timeout': runtime_module().HOOK_TIMEOUT})
         if read(hooks_path) != hooks_before:
             raise RuntimeError('project hooks changed during upgrade')
         changes.set(hooks_path, encoded(hooks))
@@ -357,15 +454,16 @@ def upgrade(root, binary, home, manifest):
         _, _, block = trust_block(root, found)
         if user_path.read_text() != user_before:
             raise RuntimeError('user config changed during upgrade')
-        user_new = user_before[:begin] + block + user_before[finish:]
+        user_new = without_trust + ('' if without_trust.endswith('\n') else '\n') + block
         tomllib.loads(user_new)
         changes.set(user_path, user_new.encode(), 0o600)
-        updated = dict(manifest, command=command, script_sha256=digest(ASSET.read_bytes()), trust_block=block,
+        updated = dict(manifest, command=command, queue_storage='shared-v1', script_sha256=digest(ASSET.read_bytes()), trust_block=block,
                        skill_version='1.0.0', backend_sha256=digest(backend),
                        trust_keys=[h['key'] for h in found], upgrade_backup=str(changes.backup))
         changes.set(root / ADMIN / 'installation.json', encoded(updated), 0o600)
         result = verify(root, binary, home, updated)
-        result.update(action='upgrade', history_retained=True, backup=str(changes.backup))
+        migrated = runtime_module().migrate_jobs(root, global_root(home) / 'coordination', changes, manifest)
+        result.update(action='upgrade', history_retained=True, backup=str(changes.backup), migrated_jobs=migrated, trust_recovered=recovered_trust)
         return result
     except BaseException:
         changes.rollback()
@@ -373,6 +471,7 @@ def upgrade(root, binary, home, manifest):
 
 
 def manage(root, action, manifest):
+    validate_layout(manifest)
     home = Path(manifest['user_config']).parent
     settings_path = root / STATE / 'settings.json'
     settings = json.loads(settings_path.read_bytes())
@@ -386,13 +485,7 @@ def manage(root, action, manifest):
             return {'action': action, 'history_retained': True}
         user_path = Path(manifest['user_config'])
         user = user_path.read_text()
-        start, end = manifest['trust_start'], manifest['trust_end']
-        if user.count(start) != 1 or user.count(end) != 1:
-            raise RuntimeError('trust markers changed; inspect before uninstall')
-        begin, finish = user.index(start), user.index(end) + len(end) + 1
-        if user[begin:finish] != manifest['trust_block']:
-            raise RuntimeError('owned trust block changed; inspect before uninstall')
-        new_user = user[:begin] + user[finish:]
+        new_user, recovered_trust = without_owned_trust(user, manifest)
         tomllib.loads(new_user)
         script = root / '.codex/hooks/first_completion.py'
         if digest(script.read_bytes()) != manifest['script_sha256']:
@@ -428,9 +521,11 @@ def manage(root, action, manifest):
         if manifest.get('backend_sha256'):
             changes.set(backend_path, None)
         changes.set(user_path, new_user.encode(), 0o600)
+        migrated = runtime_module().migrate_jobs(root, global_root(home) / 'coordination', changes, manifest)
+        manifest['queue_storage'] = 'shared-v1'
         manifest['uninstalled'] = True
         changes.set(root / ADMIN / 'installation.json', encoded(manifest), 0o600)
-        return {'action': 'uninstall', 'history_retained': True, 'backup': str(changes.backup)}
+        return {'action': 'uninstall', 'history_retained': True, 'backup': str(changes.backup), 'migrated_jobs': migrated, 'trust_recovered': recovered_trust}
     except BaseException:
         changes.rollback()
         raise
@@ -498,7 +593,7 @@ def doctor(root, binary, home, model='gpt-6-luna', effort='low'):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', action='version', version='skr-codex-auto-title 1.0.0')
-    parser.add_argument('action', choices=('doctor', 'probe', 'install', 'verify', 'upgrade', 'enable', 'disable', 'uninstall', 'project-enable', 'project-disable', 'project-status'))
+    parser.add_argument('action', choices=('doctor', 'probe', 'install', 'verify', 'upgrade', 'enable', 'disable', 'uninstall', 'project-enable', 'project-disable', 'project-status', 'project-modules', 'project-modules-clear'))
     parser.add_argument('--scope', choices=('project', 'global'), default='project')
     parser.add_argument('--root', type=Path, help='target project; required for project scope and per-project switches')
     parser.add_argument('--codex', default=shutil.which('codex') or 'codex')
@@ -523,6 +618,8 @@ def main():
     root = global_root(home) if args.scope == 'global' else project
     if args.action in ('install', 'upgrade') and not args.trust_hooks:
         parser.error('review the hook source, then supply --trust-hooks to authorize installing trusted commands')
+    if args.scope == 'global' and args.action == 'install' and args.modules_file:
+        parser.error('global install uses generic guidance; use project-modules --scope global --root <project> for project terms')
     try:
         if args.scope == 'global' and args.action == 'install':
             root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -530,8 +627,15 @@ def main():
             manifest_path = root / ADMIN / 'installation.json'
             if not manifest_path.exists():
                 raise RuntimeError('install the global hook before managing project switches')
+            validate_layout(json.loads(manifest_path.read_text()))
             with configuration_lock(home):
-                result = project_policy(home, project, args.action)
+                if args.action in ('project-modules', 'project-modules-clear'):
+                    text = args.modules_file.read_text(encoding='utf-8') if args.modules_file else None
+                    result = project_modules(home, project, args.action, text)
+                else:
+                    result = project_policy(home, project, args.action)
+                    if args.action == 'project-status':
+                        _, result['module_source'] = runtime_module().project_terms(home, project, '')
         elif args.action in ('doctor', 'probe'):
             probe_root = root if root.is_dir() else Path.cwd()
             result = doctor(probe_root, args.codex, home, args.model, args.effort) if args.action == 'doctor' else probe(probe_root, args.codex, home)

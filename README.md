@@ -72,7 +72,17 @@ uv run python install.py verify --scope project --root /absolute/path/to/project
 
 模型可用性由账号实际目录检查；需要指定其他模型时，在 doctor 和 install 后都加 `--model <available-model> --effort <supported-effort>`。
 
-项目安装可加 `--modules-file examples/modules.txt`，先把示例文件改成自己的简短项目术语。模块参考最多发送 400 字符；全局安装默认使用通用术语，不把某个项目的术语套用到其他项目。
+项目安装可加 `--modules-file examples/modules.txt`，先把示例文件改成自己的简短项目术语。模块参考最多发送 400 字符。
+
+全局安装也可为某个项目单独配置术语，无需向项目复制 Hook：
+
+```sh
+uv run python install.py project-modules --scope global --root /absolute/path/to/project --modules-file examples/modules.txt
+uv run python install.py project-status --scope global --root /absolute/path/to/project
+uv run python install.py project-modules-clear --scope global --root /absolute/path/to/project
+```
+
+子目录使用最近的项目术语，其他项目不受影响。未配置时，根据交付内容概括模块；这个通用回退没有读取项目业务说明。全局 install 不接收 --modules-file，避免把一个项目的词汇用于所有项目。
 
 如果从 Codex 对话内安装，技能会传入当前安装对话的真实 `--exclude-session-id`。纯终端安装可省略。
 
@@ -101,11 +111,11 @@ uv run python install.py verify --scope project --root /absolute/path/to/project
 
 以上合计最多 **3500 字符**，外加少量字段和命名规则；字符数不等于 token 数。短内容保持原文，长内容保留开头、结尾并标明省略。提醒片段供模型理解上下文，不直接当作失败结论。片段仍可能遗漏信息或导致误判。
 
-每次失败只尝试一次，**同一会话下一轮答复结束时再重试**，没有定时后台服务；下一轮已排队时，会在剩余后台时限内接着处理，时限耗尽仍保留到后续触发：
+遇到超时或临时服务故障，会分别等待 **2 秒、5 秒**再试，最多尝试三次。结构无效的输入或结果直接停止。三次仍失败时保留任务，**同一会话下一轮答复结束时继续**；没有定时后台服务：
 
 - 还没生成标题：下一轮用最新的精简内容重新判断。
 - 标题已生成、改名失败：直接沿用原标题继续改名，不重新调用命名模型；新一轮内容过长或无法提取请求也不阻断它。
-- 生成结果等待上限 25 秒；单次后台连接整体上限 60 秒，Hook 时限 75 秒。限制等待时间不保证远端服务一定在时限内完成。
+- 单次模型结果最多等待 60 秒，单次连接最多 120 秒，整轮后台工作最多 400 秒，Hook 外层上限 420 秒。这些是故障时的上限，正常完成后立即结束，不会等待到上限；主对话无需等待命名。
 - 关闭会话可能取消尚未完成的后台工作。主对话不会收到命名指令或被自动续跑。
 
 ## 停用、开启、更新和卸载
@@ -128,13 +138,13 @@ uv run python install.py upgrade --scope project --root /absolute/path/to/projec
 uv run python install.py uninstall --scope project --root /absolute/path/to/project
 ```
 
-以后下载新版，对同一范围运行 upgrade；保留模型、模块、启用时间、项目开关和命名记录。更新失败会尝试恢复并保留备份。临时停用用 disable，不通过卸载重装更新。卸载保留私人历史，阻止无意重装。
+以后下载新版，对同一范围运行 upgrade；保留模型、模块、启用时间、项目开关和命名记录。已发布的 1.0.0 安装会把旧队列转入共享目录，保留成功记录与待处理标题；未知安装格式会停止并保留原文件。更新失败会尝试恢复并保留备份。临时停用用 disable，不通过卸载重装更新。卸载保留私人历史，阻止无意重装。
 
 下载目录可改名或删除；移动业务项目、CODEX_HOME 或 Python/CLI 后需重新核对配置。分享时复制本仓库或技能目录，不复制已安装文件和私人记录。
 
 ## 隐私与排查
 
-精选的请求和答复会发给所选 Codex 模型，并保存在本地私人记录中。全局记录在 `CODEX_HOME/skr-codex-auto-title/runtime/`，项目记录在项目 `runtime/`；共享开关、处理资格和成功记录在个人目录的 coordination 下。不要公开提交这些目录、会话文件或安装备份。
+精选的请求和答复会发给所选 Codex 模型，并保存在本地私人记录中。全局记录在 `CODEX_HOME/skr-codex-auto-title/runtime/`，项目记录在项目 `runtime/`；共享开关、项目术语、任务队列、处理资格、待处理标题和成功记录在个人目录的 coordination 下。不要公开提交这些目录、会话文件或安装备份。
 
 无法命名时先执行对应范围的 verify，再检查本地 logs。下一轮重试只对仍启用、未被项目规则关闭、未被排除的主会话生效。详见 [管理与恢复](skills/skr-codex-auto-title/references/manage.md)。
 
